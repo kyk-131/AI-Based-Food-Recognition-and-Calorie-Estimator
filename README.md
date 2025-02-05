@@ -25,7 +25,7 @@ This project is an AI-powered food recognition and calorie estimation system. It
 ## Installation
 ### Clone the Repository
 ```sh
-git clone https://github.com/your-repo/food-recognition-calorie-estimator.git
+git clone https://github.com/AI-Based-Food-Recognition-and-Calorie-Estimator/food-recognition-calorie-estimator.git
 cd food-recognition-calorie-estimator
 ```
 ### Install Dependencies
