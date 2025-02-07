@@ -124,7 +124,7 @@ This project is licensed under the **MIT License** - You are free to modify and 
 ## 📬 Contact & Support
 💬 **Author:** KYK  
 📧 **Email:** kyk19301@gmail.com
-🌐 **GitHub:** [your-repo-link]([https://github.com/your-repo](https://github.com/kyk-131/AI-Based-Food-Recognition-and-Calorie-Estimator/tree/main))
+🌐 **GitHub:** [[your-repo-link](https://github.com/kyk-131/AI-Based-Food-Recognition-and-Calorie-Estimator/tree/main)]
 
 ---
 
