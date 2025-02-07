@@ -1,152 +1,130 @@
-!pip install kagglehub
-!pip install google-colab
-
+import io
 import os
+import requests
 import pandas as pd
-import numpy as np
-import tensorflow as tf
-import cv2
-import kagglehub
-from flask import Flask, request, jsonify, render_template, redirect, url_for
-from werkzeug.utils import secure_filename
-from tensorflow.keras.preprocessing import image
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
-from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import ReduceLROnPlateau
+from fastapi import FastAPI, File, UploadFile
+from ultralytics import YOLO
 from PIL import Image
-from google.colab import files
-from io import BytesIO
 
-# Download the Food-101 dataset
-dataset_path = kagglehub.dataset_download("dansbecker/food-101")
-print("Dataset downloaded at:", dataset_path)
+# Initialize FastAPI app
+app = FastAPI()
 
-# Upload nutrition CSV file using files.upload()
-uploaded = files.upload()
-csv_path = list(uploaded.keys())[0]  # Get the uploaded file name
+# ==================== AUTO-DOWNLOAD YOLO MODEL ====================
+MODEL_PATH = "models/yolov8_food.pt"
+if not os.path.exists(MODEL_PATH):
+    print("Downloading YOLO food detection model...")
+    os.makedirs("models", exist_ok=True)
+    url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt"
+    response = requests.get(url, stream=True)
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+            f.write(chunk)
+    print("YOLO model downloaded!")
 
-# Load the selected CSV file
-nutrition_data = pd.read_csv(BytesIO(uploaded[csv_path]))  # Read from BytesIO
-print("CSV file loaded successfully:", csv_path)
-print(nutrition_data.head())  # Display first few rows
+# Load YOLO model
+model = YOLO(MODEL_PATH)
 
-# Define Flask app
-app = Flask(__name__)
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# ==================== AUTO-DOWNLOAD NUTRITION DATABASE ====================
+NUTRITION_CSV = "nutrition_data.csv"
+NUTRITION_URL = "https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv"
 
-# Clean dataset function (optimized for Colab)
-def clean_dataset(dataset_path):
-    valid_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".gif")
-    for root, _, files in os.walk(dataset_path):
-        for file in files:
-            file_path = os.path.join(root, file)
-            if not file.lower().endswith(valid_extensions):
-                os.remove(file_path)
-            else:
-                try:
-                    # Using PIL's verify() for faster image validation
-                    Image.open(file_path).verify() 
-                except (IOError, SyntaxError):
-                    os.remove(file_path)
+if not os.path.exists(NUTRITION_CSV):
+    print("Downloading OpenFoodFacts database in chunks...")
+    with requests.get(NUTRITION_URL, stream=True) as response:
+        response.raise_for_status()
+        with open(NUTRITION_CSV, "wb") as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                file.write(chunk)
+    print("Download complete!")
 
-clean_dataset(dataset_path)
+# Read only required columns in chunks
+print("Processing OpenFoodFacts database...")
+df_iter = pd.read_csv(NUTRITION_CSV, delimiter="\t", usecols=["product_name", "energy-kcal_100g", "proteins_100g", "carbohydrates_100g", "fat_100g"], iterator=True, chunksize=10000)
+nutrition_db = pd.concat(df_iter, ignore_index=True)
+nutrition_db.to_csv(NUTRITION_CSV, index=False)
+print("Database ready!")
 
-# Load dataset using tf.data API (optimized for performance)
-dataset_dir = os.path.join(dataset_path, "food-101")
-IMG_SIZE = (224, 224)
-BATCH_SIZE = 32  # You can adjust this based on your Colab RAM
+# ==================== FASTAPI IMAGE UPLOAD ENDPOINT ====================
+@app.post("/upload/")
+async def upload_image(file: UploadFile = File(...)):
+    """Detects food items in the image and fetches their nutritional info."""
+    image = Image.open(io.BytesIO(await file.read()))
 
-def process_image(file_path):
-    img = tf.io.read_file(file_path)
-    img = tf.image.decode_jpeg(img, channels=3)
-    img = tf.image.resize(img, IMG_SIZE)
-    img = tf.image.convert_image_dtype(img, dtype=tf.float32)
-    return img
+    # Run YOLO model
+    results = model(image)
+    detected_foods = set()
 
-list_ds = tf.data.Dataset.list_files(str(dataset_dir + '/*/*'))
-train_ds = list_ds.map(process_image).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    for result in results:
+        for box in result.boxes:
+            detected_foods.add(result.names[int(box.cls)])
 
-class_names = [item.name for item in os.scandir(dataset_dir) if item.is_dir()]
-print("Classes detected:", class_names)
+    if not detected_foods:
+        return {"error": "No food detected"}
 
-# Define Model
-base_model = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-x = GlobalAveragePooling2D()(base_model.output)
-x = Dense(512, activation='relu')(x)
-x = Dropout(0.3)(x)
-x = Dense(len(class_names), activation='softmax')(x)
-model = Model(inputs=base_model.input, outputs=x)
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    # Fetch nutrition info
+    nutrition_info = {}
+    for food in detected_foods:
+        nutrition_info[food] = get_nutrition(food)
 
-# Train model
-lr_scheduler = ReduceLROnPlateau(monitor='loss', factor=0.2, patience=5, verbose=1)
-model.fit(train_ds, epochs=10, callbacks=[lr_scheduler])
-model.save("food_model.h5")
-print("Model saved.")
-
-# Function to preprocess image
-def preprocess_image(img_path):
-    img = image.load_img(img_path, target_size=(224, 224))
-    img = image.img_to_array(img)
-    img = np.expand_dims(img, axis=0) / 255.0
-    return img
-
-# Route for HTML upload page (modified for image upload)
-@app.route('/', methods=['GET', 'POST'])
-def upload_page():
-    if request.method == 'POST':
-        # Handle image upload
-        if 'file' not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files['file']
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-
-        # Redirect to prediction route with uploaded file path
-        return redirect(url_for('predict', filepath=filepath))
-
-    # Display upload form
-    # Assuming you have an 'upload.html' file in your templates folder
-    return """
-    <!doctype html>
-    <title>Upload new File</title>
-    <h1>Upload new File</h1>
-    <form method=post enctype=multipart/form-data>
-      <input type=file name=file>
-      <input type=submit value=Upload>
-    </form>
-    """
-
-# Route for prediction
-@app.route('/predict')
-def predict():
-    filepath = request.args.get('filepath')
-
-    if not filepath:
-        return jsonify({"error": "No file path provided"}), 400
-
-    img = preprocess_image(filepath)
-    predictions = model.predict(img)
-    predicted_class = class_names[np.argmax(predictions)]
-
-    nutrition_info = nutrition_data[nutrition_data['food_name'] == predicted_class]
-    if not nutrition_info.empty:
-        nutrition = nutrition_info.iloc[0].to_dict()
-    else:
-        nutrition = {"calories": "Unknown", "protein": "Unknown", "carbohydrates": "Unknown", "fat": "Unknown"}
-
-    return jsonify({"food": predicted_class, "nutrition": nutrition, "confidence": float(np.max(predictions))})
+    return {"foods_detected": list(detected_foods), "nutrition_info": nutrition_info}
 
 
-# Run the API (modified for Colab)
-def run_app():
-    from google.colab.output import eval_js
-    print(eval_js("google.colab.kernel.proxyPort(5000)"))
+# ==================== NUTRITION LOOKUP FUNCTIONS ====================
+def get_nutrition(food_name):
+    """Tries OpenFoodFacts first, then USDA API."""
+    nutrition = search_local_db(food_name)
+    if not nutrition:
+        nutrition = fetch_usda(food_name)
+    return nutrition if nutrition else {"calories": "Unknown", "protein": "Unknown", "carbs": "Unknown", "fat": "Unknown"}
 
-if __name__ == '__main__':
-    run_app()
+
+def search_local_db(food_name):
+    """Search OpenFoodFacts CSV for nutrition data."""
+    match = nutrition_db[nutrition_db["product_name"].str.contains(food_name, case=False, na=False)]
+    if not match.empty:
+        row = match.iloc[0]
+        return {
+            "calories": row["energy-kcal_100g"],
+            "protein": row["proteins_100g"],
+            "carbs": row["carbohydrates_100g"],
+            "fat": row["fat_100g"]
+        }
+    return None
+
+
+def fetch_usda(food_name):
+    """Fetch nutrition data from USDA API."""
+    USDA_API_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
+    USDA_API_KEY = "54tjbbR0SsWeESfETrxtmGRibk0qtO7etLWneN97"  # Replace with your own API key
+
+    try:
+        params = {"query": food_name, "api_key": USDA_API_KEY}
+        response = requests.get(USDA_API_URL, params=params)
+        data = response.json()
+
+        if "foods" in data and data["foods"]:
+            nutrients = data["foods"][0]["foodNutrients"]
+            return {
+                "calories": find_nutrient(nutrients, 208),
+                "protein": find_nutrient(nutrients, 203),
+                "carbs": find_nutrient(nutrients, 205),
+                "fat": find_nutrient(nutrients, 204)
+            }
+    except Exception:
+        pass
+
+    return None
+
+
+def find_nutrient(nutrients, id):
+    """Extract specific nutrient value from USDA response."""
+    for nutrient in nutrients:
+        if nutrient["nutrientId"] == id:
+            return nutrient["value"]
+    return "Unknown"
+
+
+# ==================== RUN FASTAPI SERVER ====================
+if _name_ == "_main_":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
